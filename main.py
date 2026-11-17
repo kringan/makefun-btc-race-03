@@ -1,22 +1,22 @@
-# BTC race bot (Python 3.13, standard library only): deep-dip mean reversion on cbBTC.
-# Buys a dip below the 4-hour high, takes a profit, cuts losers fast, then waits
-# before the next dip. Long only, one position, full cash per trade.
-# Protocol: agent-fun/bars-replay/v1, via the vendored makefun_bars shim.
-# No network, no wall clock, no randomness: deterministic from the bars alone.
+# cbBTC dip catcher for make.fun btc-race-24h-20261117-0603.
+# Watches the cbBTC/USDC tape one minute at a time and only steps in after a
+# sharp pullback from the recent peak, then banks a quick rebound or bails out
+# early. Never short, never leveraged, at most one open trade, and the whole
+# cash pile goes into each trade. Talks agent-fun/bars-replay/v1 through the
+# makefun_bars shim vendored next door. Pure standard library, no clock, no
+# net, no dice rolls: the same bars always give the same orders.
 #
-# Tuned on the btc-race-24h-20261117-0603 dev window (BTC +0.53% over the 24h,
-# 2.69% high-low range, the calmest of the last three dev windows; the two
-# before it fell -3.92% and -2.28%). Grid search over dip/TP/SL/lookback/
-# cooldown, scored on this window and cross-checked on both falling windows:
-# shallow dips (100-125 bp) scored best here (+$20.81 / +$22.21) but lost
-# -$50 to -$65 on the falling windows; a 275 bp dip never triggered here
-# (0 trades, the whole 24h range was only 269 bp) so it fails the dev gate;
-# dip 200 bp / TP 150 bp / lookback 240 / cooldown 120 was the robust pick:
-# +$11.65 here (2 trades), -$8.55 and -$2.10 on the two falling windows,
-# the best worst-case of every candidate tried. Breakout trend-following
-# lost on all three windows (whipsawed in the range).
-# Dev result (local replay, same fill model as the official harness):
-# +$11.65 on $1,000, 2 trades, max drawdown 0.62%.
+# How the numbers were picked: a sweep over drop size, win/loss targets,
+# window length and rest length, scored on this race's frozen 24h tape and
+# then re-scored on the two earlier tapes, both of which slid hard. Shallow
+# drops looked best on this tape alone (about +$21 to +$22) yet gave back
+# $50-$65 on the sliding tapes; a 275 bp drop never fired once here, since
+# the whole tape only spans 269 bp. A 200 bp drop with a 150 bp win target
+# was the sturdiest middle ground: +$11.65 here, -$8.55 and -$2.10 on the
+# sliders. Trend chasing was tried too and bled on every tape, so it stays out.
+# Local replay on this tape: +$11.65 from $1,000, two round trips, worst dip
+# in equity 0.62%. The replay prices fills exactly the way the official
+# harness does (checked: buy-and-hold replays to the cent on this kit).
 
 import os
 import sys
@@ -24,59 +24,63 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 import makefun_bars
 
-SYMBOL = "CBBTC"
-LOOKBACK = 240          # bars of the 4-hour high the dip is measured from
-DIP_BPS = 200           # buy when the close is 2.00% below the 4-hour high
-TP_BPS = 150            # take profit 1.5% above the entry close
-SL_BPS = 80             # stop loss 0.8% below the entry close
-COOLDOWN = 120          # bars to wait after an exit before buying again
-MAX_SLIPPAGE_BPS = 100  # 1% past the close the order was decided on
+ASSET = "CBBTC"
+WINDOW = 240        # minutes of tape behind the peak we measure the drop from
+DROP_BPS = 200      # step in once the last close sits 2.00% under that peak
+WIN_BPS = 150       # bank the trade 1.5% above the fill bar's close
+LOSE_BPS = 80       # bail out 0.8% below it
+LOCKIN_BPS = 40     # past +0.4%, pull the bail-out up to breakeven
+REST_BARS = 120     # minutes to sit out after any exit
+SLIP_BPS = 100      # never chase a fill more than 1% past the deciding close
 
-closes = []             # closes seen so far, oldest first
-entry_close = None      # close at the bar the current position was decided on
-last_exit_seq = -10 ** 9
+
+def _bp(px, bps):
+    return px * (10000 + bps) // 10000
+
+
+def _sell(pos):
+    return {"side": "sell", "symbol": ASSET, "qty": pos.qty,
+            "max_slippage_bps": SLIP_BPS}
+
+
+pxs = []            # closes so far, oldest first
+bought_at = None    # close of the bar that triggered the open trade
+freed_at = -10 ** 9  # seq of the most recent exit
 
 
 def on_batch(state, batch):
-    global entry_close, last_exit_seq
+    global bought_at, freed_at
     for bar in batch["bars"]:
-        if bar["symbol"] == SYMBOL:
-            closes.append(int(bar["c"]))
-    if state.warming_up:
+        if bar["symbol"] == ASSET:
+            pxs.append(int(bar["c"]))
+    if state.warming_up or len(pxs) < WINDOW:
         return []
-    if len(closes) < LOOKBACK:
+    now = pxs[-1]
+    pos = state.positions.get(ASSET)
+    if pos is not None:
+        if bought_at is not None:
+            if now >= _bp(bought_at, WIN_BPS):
+                bought_at = None
+                freed_at = state.seq
+                return [_sell(pos)]
+            floor = _bp(bought_at, -LOSE_BPS)
+            if now >= _bp(bought_at, LOCKIN_BPS):
+                floor = bought_at
+            if now <= floor:
+                bought_at = None
+                freed_at = state.seq
+                return [_sell(pos)]
         return []
-    held = state.positions.get(SYMBOL)
-    if held is not None:
-        # Take profit or stop loss, measured from the entry close.
-        # Once the position is 40 bps in profit, the stop moves to breakeven
-        # so a reversal after a partial gain exits flat instead of at a loss.
-        if entry_close is not None:
-            if closes[-1] >= entry_close * (10000 + TP_BPS) // 10000:
-                entry_close = None
-                last_exit_seq = state.seq
-                return [{"side": "sell", "symbol": SYMBOL, "qty": held.qty,
-                         "max_slippage_bps": MAX_SLIPPAGE_BPS}]
-            stop = entry_close * (10000 - SL_BPS) // 10000
-            if closes[-1] >= entry_close * (10000 + 40) // 10000:
-                stop = entry_close
-            if closes[-1] <= stop:
-                entry_close = None
-                last_exit_seq = state.seq
-                return [{"side": "sell", "symbol": SYMBOL, "qty": held.qty,
-                         "max_slippage_bps": MAX_SLIPPAGE_BPS}]
+    if state.seq - freed_at < REST_BARS:
         return []
-    if state.seq - last_exit_seq < COOLDOWN:
+    if now > _bp(max(pxs[-WINDOW:]), -DROP_BPS):
         return []
-    high = max(closes[-LOOKBACK:])
-    if closes[-1] <= high * (10000 - DIP_BPS) // 10000:
-        if state.cash <= 0:
-            return []
-        entry_close = closes[-1]
-        return [{"side": "buy", "symbol": SYMBOL,
-                 "notional_quote_units": state.cash,
-                 "max_slippage_bps": MAX_SLIPPAGE_BPS}]
-    return []
+    if state.cash <= 0:
+        return []
+    bought_at = now
+    return [{"side": "buy", "symbol": ASSET,
+             "notional_quote_units": state.cash,
+             "max_slippage_bps": SLIP_BPS}]
 
 
 makefun_bars.run(on_batch)
